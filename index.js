@@ -36,9 +36,10 @@ function sydneyNowParts() {
 
 // ISO timestamp -> "HH:MM" clock time in Sydney
 function toClock(iso) {
-  return new Date(iso).toLocaleTimeString("en-GB", {
-    timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false,
+  let s = new Date(iso).toLocaleTimeString("en-US", {
+    timeZone: TZ, hour: "numeric", minute: "2-digit", hour12: true,
   });
+  return s.replace(/\s?[AP]M$/i, "");  // drop the AM/PM to save panel space
 }
 
 // Whole minutes from now until the given ISO timestamp
