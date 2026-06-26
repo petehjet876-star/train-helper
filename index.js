@@ -34,6 +34,16 @@ function sydneyNowParts() {
   };
 }
 
+// Seconds since Sydney midnight (0–86399), for the board's clock
+function sydneyDaySeconds() {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).formatToParts(new Date()).map((x) => [x.type, x.value])
+  );
+  return (+p.hour) * 3600 + (+p.minute) * 60 + (+p.second);
+}
+
 // ISO timestamp -> "HH:MM" clock time in Sydney
 function toClock(iso) {
   let s = new Date(iso).toLocaleTimeString("en-US", {
@@ -146,7 +156,7 @@ app.get("/trains", async (_req, res) => {
     const { time } = sydneyNowParts();
     const updated = `${time.slice(0, 2)}:${time.slice(2)}`;
 
-    res.json({ updated, trains });
+    res.json({ updated, day_seconds: sydneyDaySeconds(), trains });
   } catch (err) {
     res.json({ trains: [], error: String(err) });
   }
