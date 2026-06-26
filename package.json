@@ -1,0 +1,16 @@
+{
+  "name": "train-display-helper",
+  "version": "1.0.0",
+  "description": "Fetches St Peters -> Central departures from the TfNSW Trip Planner API and serves minimal JSON for an LED matrix display.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
