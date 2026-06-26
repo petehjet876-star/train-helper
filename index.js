@@ -59,35 +59,48 @@ function buildUrl() {
     name_origin: ORIGIN,
     type_destination: "any",
     name_destination: DESTINATION,
-    calcNumberOfTrips: "6",   // ask for extra; we filter + trim to 3
+    calcNumberOfTrips: "10",  // ask for extra; we filter to trains + trim to 3
     TfNSWTR: "true",          // include real-time data
   });
   return `${TP_BASE}?${qs.toString()}`;
 }
 
-// Pull the few fields we care about out of one journey
+// Is this leg a Sydney/NSW train?
+// Mode classes: 1 = train, 2 = metro, 4 = light rail, 5 = bus,
+// 7 = coach, 9 = ferry, 11 = school bus.
+function isTrain(leg) {
+  const t = leg.transportation || {};
+  const cls = t.product && t.product.class;
+  if (cls === 1) return true;          // confirmed train
+  if (cls !== undefined) return false; // confirmed something else (e.g. bus 370)
+  // Fallback if the class field is missing: train lines look like "T1".."T8"
+  const name = (t.disassembledName || t.number || "").toUpperCase();
+  return /^T\d/.test(name);
+}
+
+// Pull the few fields we care about out of one journey.
+// Returns null for anything that isn't a train trip starting at St Peters.
 function simplifyJourney(journey) {
   const legs = journey.legs || [];
-  if (legs.length === 0) return null;
+  const transitLegs = legs.filter((l) => l.transportation);
+  if (transitLegs.length === 0) return null;
 
-  // Departure from St Peters = first leg's origin time (prefer real-time)
-  const firstOrigin = legs[0].origin || {};
-  const depIso =
-    firstOrigin.departureTimeEstimated || firstOrigin.departureTimePlanned;
+  // The first thing you board must be a train, otherwise skip this journey
+  const firstTransit = transitLegs[0];
+  if (!isTrain(firstTransit)) return null;
 
-  // Arrival at Central = last leg's destination time (prefer real-time)
+  // Departure from St Peters = the train leg's origin time (prefer real-time)
+  const dep = firstTransit.origin || {};
+  const depIso = dep.departureTimeEstimated || dep.departureTimePlanned;
+
+  // Arrival at Central = the journey's final destination time (prefer real-time)
   const lastDest = legs[legs.length - 1].destination || {};
-  const arrIso =
-    lastDest.arrivalTimeEstimated || lastDest.arrivalTimePlanned;
+  const arrIso = lastDest.arrivalTimeEstimated || lastDest.arrivalTimePlanned;
 
   if (!depIso || !arrIso) return null;
 
-  // Line label (e.g. "T4") from the first transit leg, if present
-  const transitLeg = legs.find((l) => l.transportation);
-  const line =
-    transitLeg?.transportation?.disassembledName ||
-    transitLeg?.transportation?.number ||
-    "";
+  const t = firstTransit.transportation || {};
+  const line = t.disassembledName || t.number || "";
 
   return {
     depart_min: minutesFromNow(depIso),
