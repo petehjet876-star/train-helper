@@ -225,6 +225,7 @@ async function getUpcomingEvents() {
 
   // Sort timed events by start; all-day events sort last (no startMs).
   all.sort((a, b) => (a.startMs || Infinity) - (b.startMs || Infinity));
+  console.log("CALENDAR DEBUG:", CALENDAR_IDS.length, "calendars,", all.length, "events found:", JSON.stringify(all.map(e => e.name)));
   return all;
 }
 
