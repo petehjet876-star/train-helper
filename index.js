@@ -5,10 +5,10 @@
 //   2. /display - the board's main endpoint. Decides each request whether
 //                 to show an upcoming shoot ("leave by" times, tolls vs
 //                 no-tolls) or fall back to trains.
-// The board just fetches /display and draws whatever mode comes back.
+// Plus /debug   - a temporary diagnostic endpoint (safe to remove later).
 //
 // Secrets all come from Railway env vars, never from code:
-//   TFNSW_API_KEY           - TfNSW Trip Planner key (existing)
+//   TFNSW_API_KEY           - TfNSW Trip Planner key
 //   MAPS_API_KEY            - Google Maps "Routes API" key
 //   HOME_ORIGIN            - address to measure drive time from
 //   CALENDAR_IDS           - comma-separated Google calendar IDs
@@ -51,7 +51,6 @@ const MAX_PLAUSIBLE_DRIVE_MIN = 150; // don't spend a Routes call on far events
 
 // --- Time helpers ---------------------------------------------------------
 
-// Current date/time in Sydney as the TfNSW API wants it: YYYYMMDD + HHMM
 function sydneyNowParts() {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-GB", {
@@ -68,7 +67,6 @@ function sydneyNowParts() {
   };
 }
 
-// Seconds since Sydney midnight (0-86399), for the board's clock
 function sydneyDaySeconds() {
   const p = Object.fromEntries(
     new Intl.DateTimeFormat("en-GB", {
@@ -78,7 +76,6 @@ function sydneyDaySeconds() {
   return (+p.hour) * 3600 + (+p.minute) * 60 + (+p.second);
 }
 
-// Sydney date as YYYY-MM-DD (for matching all-day events to "today")
 function sydneyDateStr(d) {
   const p = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
@@ -88,7 +85,6 @@ function sydneyDateStr(d) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
-// A Date -> "H:MM" Sydney clock time, no AM/PM (to save panel space)
 function toClockDate(d) {
   const s = d.toLocaleTimeString("en-US", {
     timeZone: TZ, hour: "numeric", minute: "2-digit", hour12: true,
@@ -104,7 +100,7 @@ function minutesFromNow(iso) {
   return Math.round((new Date(iso).getTime() - Date.now()) / 60000);
 }
 
-// --- Trains (unchanged logic, just refactored into a function) ------------
+// --- Trains ---------------------------------------------------------------
 
 function buildUrl() {
   const { date, time } = sydneyNowParts();
@@ -188,7 +184,6 @@ function calendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
-// Pull upcoming events from all configured calendars, merged + sorted.
 async function getUpcomingEvents() {
   const cal = calendarClient();
   if (!cal || CALENDAR_IDS.length === 0) return [];
@@ -223,15 +218,13 @@ async function getUpcomingEvents() {
     }
   }
 
-  // Sort timed events by start; all-day events sort last (no startMs).
   all.sort((a, b) => (a.startMs || Infinity) - (b.startMs || Infinity));
-  console.log("CALENDAR DEBUG:", CALENDAR_IDS.length, "calendars,", all.length, "events found:", JSON.stringify(all.map(e => e.name)));
   return all;
 }
 
 // --- Drive time (Google Routes API) with a small cache --------------------
 
-const routeCache = new Map(); // eventId -> { at, data }
+const routeCache = new Map();
 const ROUTE_TTL_MS = 10 * 60 * 1000;
 
 async function callRoutes(destination, avoidTolls, withTolls) {
@@ -264,7 +257,6 @@ async function callRoutes(destination, avoidTolls, withTolls) {
   return r.json();
 }
 
-// Returns { driveTolls, driveNoTolls, tollText } in minutes, or null.
 async function computeRoute(destination) {
   if (!MAPS_KEY || !HOME_ORIGIN || !destination) return null;
 
@@ -322,7 +314,6 @@ async function getDisplayPayload() {
   let nameOnly = null;
 
   for (const ev of events) {
-    // Located, timed event -> try to compute drive time / leave-by
     if (ev.location && !ev.allDay && ev.startMs) {
       const minsToStart = (ev.startMs - now) / 60000;
       let route = null;
@@ -351,10 +342,9 @@ async function getDisplayPayload() {
             drive_notolls_min: route.driveNoTolls,
             toll_cost: route.tollText,
           };
-          break; // located always wins - stop looking
+          break;
         }
       } else if (minsToStart <= NAMEONLY_LEAD_MIN && minsToStart >= -GRACE_MIN) {
-        // routing failed -> at least show it as a name-only reminder
         if (!nameOnly) {
           nameOnly = {
             name: ev.name,
@@ -366,7 +356,6 @@ async function getDisplayPayload() {
       continue;
     }
 
-    // All-day event from your own calendars -> name-only, active today
     if (ev.allDay) {
       if (ev.dateStr === todaySyd && !nameOnly) {
         nameOnly = { name: ev.name, has_route: false, start_time: "" };
@@ -374,7 +363,6 @@ async function getDisplayPayload() {
       continue;
     }
 
-    // Timed, no location -> name-only reminder 60 min before start
     if (ev.startMs) {
       const minsToStart = (ev.startMs - now) / 60000;
       if (minsToStart <= NAMEONLY_LEAD_MIN && minsToStart >= -GRACE_MIN && !nameOnly) {
@@ -402,10 +390,9 @@ async function getDisplayPayload() {
 // --- Routes ---------------------------------------------------------------
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "train-helper", routes: ["/trains", "/display"] });
+  res.json({ ok: true, service: "train-helper", routes: ["/trains", "/display", "/debug"] });
 });
 
-// Kept for testing - pure trains, same shape as before
 app.get("/trains", async (_req, res) => {
   try {
     const { time } = sydneyNowParts();
@@ -421,12 +408,10 @@ app.get("/trains", async (_req, res) => {
   }
 });
 
-// The board's main endpoint - event mode or train mode
 app.get("/display", async (_req, res) => {
   try {
     res.json(await getDisplayPayload());
   } catch (err) {
-    // Last-resort fallback so the board always gets something sane
     const { time } = sydneyNowParts();
     res.json({
       mode: "trains",
@@ -436,6 +421,31 @@ app.get("/display", async (_req, res) => {
       error: String(err),
     });
   }
+});
+
+// Temporary diagnostic - shows exactly what the calendar read returns.
+// Safe to delete once everything works.
+app.get("/debug", async (_req, res) => {
+  const out = {
+    has_service_account: !!SERVICE_ACCOUNT,
+    has_maps_key: !!MAPS_KEY,
+    has_home_origin: !!HOME_ORIGIN,
+    calendars_configured: CALENDAR_IDS.length,
+    calendar_ids: CALENDAR_IDS,
+  };
+  try {
+    const events = await getUpcomingEvents();
+    out.events_found = events.length;
+    out.events = events.map((e) => ({
+      name: e.name,
+      location: e.location,
+      allDay: e.allDay,
+      start: e.startMs ? new Date(e.startMs).toISOString() : e.dateStr,
+    }));
+  } catch (err) {
+    out.error = String(err);
+  }
+  res.json(out);
 });
 
 app.listen(PORT, () => {
