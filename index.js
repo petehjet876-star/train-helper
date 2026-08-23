@@ -1,18 +1,12 @@
 // Train + shoot display helper
 // -----------------------------------------------------------------------
-// Two jobs:
-//   1. /trains  - next 3 trains St Peters -> Central (TfNSW Trip Planner)
-//   2. /display - the board's main endpoint. Decides each request whether
-//                 to show an upcoming shoot ("leave by" times, tolls vs
-//                 no-tolls) or fall back to trains.
-// Plus /debug   - a temporary diagnostic endpoint (safe to remove later).
+//   /trains  - next 3 trains St Peters -> Central (TfNSW Trip Planner)
+//   /display - the board's main endpoint (event mode or train mode)
+//   /debug   - temporary diagnostic (safe to remove later)
 //
-// Secrets all come from Railway env vars, never from code:
-//   TFNSW_API_KEY           - TfNSW Trip Planner key
-//   MAPS_API_KEY            - Google Maps "Routes API" key
-//   HOME_ORIGIN            - address to measure drive time from
-//   CALENDAR_IDS           - comma-separated Google calendar IDs
-//   GOOGLE_SERVICE_ACCOUNT - the whole service-account JSON, pasted in
+// Env vars (all set in Railway, never in code):
+//   TFNSW_API_KEY, MAPS_API_KEY, HOME_ORIGIN,
+//   CALENDAR_IDS, GOOGLE_SERVICE_ACCOUNT
 
 import express from "express";
 import { google } from "googleapis";
@@ -38,16 +32,19 @@ try {
 
 const ORIGIN = "204410"; // St Peters Station (trains)
 const DESTINATION = "200060"; // Central Station
+// Pennant Hills station (nearest to uni) as coordinates "lng:lat:EPSG:4326"
+const UNI_STATION_COORD = "151.0725:-33.7383:EPSG:4326";
 const TRIPS_TO_SHOW = 3;
 const TZ = "Australia/Sydney";
 const TP_BASE = "https://api.transport.nsw.gov.au/v1/tp/trip";
 
-// Event display tuning (all in minutes / hours)
-const LOCATED_LEAD_MIN = 120; // show a located shoot this long before leave-by
-const NAMEONLY_LEAD_MIN = 60; // show a name-only event this long before start
-const GRACE_MIN = 20; // keep showing this long after leave-by/start passes
-const LOOKAHEAD_HOURS = 6; // how far ahead to read calendar events
-const MAX_PLAUSIBLE_DRIVE_MIN = 150; // don't spend a Routes call on far events
+// Event display tuning (minutes / hours)
+const LOCATED_LEAD_MIN = 120;
+const NAMEONLY_LEAD_MIN = 60;
+const GRACE_MIN = 20;
+const LOOKAHEAD_HOURS = 6;
+const MAX_PLAUSIBLE_DRIVE_MIN = 150;
+const DRIVE_BUFFER_MIN = 5; // show leave-by this many minutes earlier (Maps runs a bit optimistic)
 
 // --- Time helpers ---------------------------------------------------------
 
@@ -102,7 +99,7 @@ function minutesFromNow(iso) {
 
 // --- Trains ---------------------------------------------------------------
 
-function buildUrl() {
+function buildTripUrl(destType, destName, numTrips) {
   const { date, time } = sydneyNowParts();
   const qs = new URLSearchParams({
     outputFormat: "rapidJSON",
@@ -112,9 +109,9 @@ function buildUrl() {
     itdTime: time,
     type_origin: "any",
     name_origin: ORIGIN,
-    type_destination: "any",
-    name_destination: DESTINATION,
-    calcNumberOfTrips: "10",
+    type_destination: destType,
+    name_destination: destName,
+    calcNumberOfTrips: String(numTrips),
     TfNSWTR: "true",
   });
   return `${TP_BASE}?${qs.toString()}`;
@@ -157,7 +154,7 @@ function simplifyJourney(journey) {
 
 async function getTrains() {
   if (!API_KEY) return { trains: [], error: "TFNSW_API_KEY not set" };
-  const resp = await fetch(buildUrl(), {
+  const resp = await fetch(buildTripUrl("any", DESTINATION, 10), {
     headers: { Authorization: `apikey ${API_KEY}` },
   });
   if (!resp.ok) {
@@ -171,6 +168,45 @@ async function getTrains() {
     .filter((t) => t && t.depart_min >= 0)
     .slice(0, TRIPS_TO_SHOW);
   return { trains };
+}
+
+// Uni train: St Peters -> Pennant Hills, soonest journey, depart + arrive.
+function simplifyUniJourney(journey) {
+  const legs = journey.legs || [];
+  const transitLegs = legs.filter((l) => l.transportation);
+  if (transitLegs.length === 0) return null;
+
+  const firstTransit = transitLegs[0];
+  if (!isTrain(firstTransit)) return null;
+
+  const dep = firstTransit.origin || {};
+  const depIso = dep.departureTimeEstimated || dep.departureTimePlanned;
+
+  const lastTransit = transitLegs[transitLegs.length - 1];
+  const arrDest = lastTransit.destination || {};
+  const arrIso = arrDest.arrivalTimeEstimated || arrDest.arrivalTimePlanned;
+
+  if (!depIso || !arrIso) return null;
+
+  return {
+    depart_min: minutesFromNow(depIso),
+    depart_time: toClock(depIso),
+    arrive_time: toClock(arrIso),
+  };
+}
+
+async function getUniTrain() {
+  if (!API_KEY) return null;
+  const resp = await fetch(buildTripUrl("coord", UNI_STATION_COORD, 6), {
+    headers: { Authorization: `apikey ${API_KEY}` },
+  });
+  if (!resp.ok) throw new Error(`TfNSW uni ${resp.status}`);
+  const data = await resp.json();
+  const journeys = data.journeys || [];
+  const list = journeys
+    .map(simplifyUniJourney)
+    .filter((t) => t && t.depart_min >= 0);
+  return list[0] || null;
 }
 
 // --- Calendar -------------------------------------------------------------
@@ -220,6 +256,11 @@ async function getUpcomingEvents() {
 
   all.sort((a, b) => (a.startMs || Infinity) - (b.startMs || Infinity));
   return all;
+}
+
+// Is this event at uni? (matches the Excelsia address)
+function isUni(location) {
+  return /cityview|excelsia/i.test(location || "");
 }
 
 // --- Drive time (Google Routes API) with a small cache --------------------
@@ -326,22 +367,51 @@ async function getDisplayPayload() {
       }
 
       if (route) {
-        const leaveTollsMs = ev.startMs - route.driveTolls * 60000;
-        const leaveNoTollsMs = ev.startMs - route.driveNoTolls * 60000;
-        const minsToLeave = (leaveTollsMs - now) / 60000;
+        const uni = isUni(ev.location);
+        // leave-by times, with the 5-min buffer baked in
+        const leaveTollsMs = ev.startMs - (route.driveTolls + DRIVE_BUFFER_MIN) * 60000;
+        const leaveNoTollsMs = ev.startMs - (route.driveNoTolls + DRIVE_BUFFER_MIN) * 60000;
+        // window reference: no-tolls for uni (drive option shown), tolls otherwise
+        const refLeaveMs = uni ? leaveNoTollsMs : leaveTollsMs;
+        const minsToLeave = (refLeaveMs - now) / 60000;
+
         if (minsToLeave <= LOCATED_LEAD_MIN && minsToLeave >= -GRACE_MIN) {
-          located = {
-            name: ev.name,
-            has_route: true,
-            start_time: toClockDate(new Date(ev.startMs)),
-            leave_tolls: toClockDate(new Date(leaveTollsMs)),
-            leave_notolls: toClockDate(new Date(leaveNoTollsMs)),
-            leave_tolls_min: Math.round((leaveTollsMs - now) / 60000),
-            leave_notolls_min: Math.round((leaveNoTollsMs - now) / 60000),
-            drive_tolls_min: route.driveTolls,
-            drive_notolls_min: route.driveNoTolls,
-            toll_cost: route.tollText,
-          };
+          if (uni) {
+            let train = null;
+            try {
+              train = await getUniTrain();
+            } catch (e) {
+              console.error("uni train error:", e.message);
+            }
+            located = {
+              name: ev.name,
+              has_route: true,
+              is_uni: true,
+              start_time: toClockDate(new Date(ev.startMs)),
+              leave_notolls: toClockDate(new Date(leaveNoTollsMs)),
+              leave_notolls_min: Math.round((leaveNoTollsMs - now) / 60000),
+              drive_notolls_min: route.driveNoTolls,
+            };
+            if (train) {
+              located.train_depart = train.depart_time;
+              located.train_arrive = train.arrive_time;
+              located.train_depart_min = train.depart_min;
+            }
+          } else {
+            located = {
+              name: ev.name,
+              has_route: true,
+              is_uni: false,
+              start_time: toClockDate(new Date(ev.startMs)),
+              leave_tolls: toClockDate(new Date(leaveTollsMs)),
+              leave_notolls: toClockDate(new Date(leaveNoTollsMs)),
+              leave_tolls_min: Math.round((leaveTollsMs - now) / 60000),
+              leave_notolls_min: Math.round((leaveNoTollsMs - now) / 60000),
+              drive_tolls_min: route.driveTolls,
+              drive_notolls_min: route.driveNoTolls,
+              toll_cost: route.tollText,
+            };
+          }
           break;
         }
       } else if (minsToStart <= NAMEONLY_LEAD_MIN && minsToStart >= -GRACE_MIN) {
@@ -423,8 +493,7 @@ app.get("/display", async (_req, res) => {
   }
 });
 
-// Temporary diagnostic - shows exactly what the calendar read returns.
-// Safe to delete once everything works.
+// Temporary diagnostic - safe to delete once everything works.
 app.get("/debug", async (_req, res) => {
   const out = {
     has_service_account: !!SERVICE_ACCOUNT,
@@ -439,6 +508,7 @@ app.get("/debug", async (_req, res) => {
     out.events = events.map((e) => ({
       name: e.name,
       location: e.location,
+      is_uni: isUni(e.location),
       allDay: e.allDay,
       start: e.startMs ? new Date(e.startMs).toISOString() : e.dateStr,
     }));
@@ -446,6 +516,16 @@ app.get("/debug", async (_req, res) => {
     out.error = String(err);
   }
   res.json(out);
+});
+
+// Uni train test endpoint - hit /uni-test to check the Pennant Hills lookup.
+app.get("/uni-test", async (_req, res) => {
+  try {
+    const train = await getUniTrain();
+    res.json({ train });
+  } catch (err) {
+    res.json({ error: String(err) });
+  }
 });
 
 app.listen(PORT, () => {
