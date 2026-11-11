@@ -243,7 +243,7 @@ async function getUpcomingEvents() {
         all.push({
           id: ev.id,
           name: ev.summary || "(no title)",
-          location: (ev.location || "").trim(),
+          location: (ev.location || "").replace(/\s+/g, " ").trim(),
           allDay: !timed,
           dateStr: timed ? null : (ev.start && ev.start.date) || null,
           startMs: timed ? new Date(ev.start.dateTime).getTime() : null,
